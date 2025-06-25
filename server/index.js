@@ -3,6 +3,7 @@ import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { v4 as uuidv4 } from 'uuid';
+import axios from 'axios';
 
 const app = express();
 const server = createServer(app);
@@ -70,24 +71,22 @@ const clients = new Set();
 wss.on('connection', (ws) => {
   clients.add(ws);
   console.log('New WebSocket connection');
-  
+
   ws.on('close', () => {
     clients.delete(ws);
     console.log('WebSocket connection closed');
   });
 });
 
-// Broadcast updates to all connected clients
 function broadcastUpdate(data) {
   const message = JSON.stringify(data);
   clients.forEach(client => {
-    if (client.readyState === 1) { // WebSocket.OPEN
+    if (client.readyState === 1) {
       client.send(message);
     }
   });
 }
 
-// Update auction timers every second
 setInterval(() => {
   let updated = false;
   auctionData.products.forEach(product => {
@@ -96,49 +95,32 @@ setInterval(() => {
       updated = true;
     }
   });
-  
+
   if (updated) {
     broadcastUpdate({ type: 'timer-update', products: auctionData.products });
   }
 }, 1000);
 
-// API Routes
 app.get('/api/auctions', (req, res) => {
   res.json(auctionData);
 });
 
 app.get('/api/auctions/:id', (req, res) => {
   const product = auctionData.products.find(p => p.id === req.params.id);
-  if (!product) {
-    return res.status(404).json({ error: 'Product not found' });
-  }
+  if (!product) return res.status(404).json({ error: 'Product not found' });
   res.json(product);
 });
 
 app.post('/api/auctions/:id/bid', (req, res) => {
   const { amount, bidder } = req.body;
   const productId = req.params.id;
-  
-  if (!amount || !bidder) {
-    return res.status(400).json({ error: 'Amount and bidder are required' });
-  }
+  if (!amount || !bidder) return res.status(400).json({ error: 'Amount and bidder are required' });
 
   const product = auctionData.products.find(p => p.id === productId);
-  if (!product) {
-    return res.status(404).json({ error: 'Product not found' });
-  }
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+  if (product.timeRemaining <= 0) return res.status(400).json({ error: 'Auction has ended' });
+  if (amount <= product.currentBid) return res.status(400).json({ error: `Bid must be higher than current bid of $${product.currentBid.toLocaleString()}` });
 
-  if (product.timeRemaining <= 0) {
-    return res.status(400).json({ error: 'Auction has ended' });
-  }
-
-  if (amount <= product.currentBid) {
-    return res.status(400).json({ 
-      error: `Bid must be higher than current bid of $${product.currentBid.toLocaleString()}` 
-    });
-  }
-
-  // Place the bid
   const newBid = {
     id: uuidv4(),
     amount: parseInt(amount),
@@ -148,84 +130,35 @@ app.post('/api/auctions/:id/bid', (req, res) => {
 
   product.bidHistory.push(newBid);
   product.currentBid = parseInt(amount);
-  
-  // Update stats
   auctionData.stats.totalBids++;
   auctionData.stats.totalValue = auctionData.products.reduce((sum, p) => sum + p.currentBid, 0);
 
-  // Broadcast update
-  broadcastUpdate({ 
-    type: 'new-bid', 
-    productId, 
-    product, 
-    stats: auctionData.stats 
-  });
+  broadcastUpdate({ type: 'new-bid', productId, product, stats: auctionData.stats });
 
   res.json({ success: true, bid: newBid, product });
 });
 
-// Voice agent simulation endpoints
 app.post('/api/voice/list-products', (req, res) => {
-  const products = auctionData.products.map(p => ({
-    id: p.id,
-    name: p.name,
-    currentBid: p.currentBid,
-    timeRemaining: p.timeRemaining
-  }));
-  
-  res.json({
-    response: `There are ${products.length} items currently available for auction.`,
-    products
-  });
+  const products = auctionData.products.map(p => ({ id: p.id, name: p.name, currentBid: p.currentBid, timeRemaining: p.timeRemaining }));
+  res.json({ response: `There are ${products.length} items currently available for auction.`, products });
 });
 
 app.post('/api/voice/product-info/:id', (req, res) => {
   const product = auctionData.products.find(p => p.id === req.params.id);
-  if (!product) {
-    return res.status(404).json({ error: 'Product not found' });
-  }
-
+  if (!product) return res.status(404).json({ error: 'Product not found' });
   const hours = Math.floor(product.timeRemaining / 3600);
   const minutes = Math.floor((product.timeRemaining % 3600) / 60);
   const timeString = hours > 0 ? `${hours} hours and ${minutes} minutes` : `${minutes} minutes`;
-
-  res.json({
-    response: `${product.name}: ${product.description}. Current highest bid is $${product.currentBid.toLocaleString()}. Time remaining: ${timeString}.`,
-    product
-  });
+  res.json({ response: `${product.name}: ${product.description}. Current highest bid is $${product.currentBid.toLocaleString()}. Time remaining: ${timeString}.`, product });
 });
 
 app.post('/api/voice/place-bid/:id', (req, res) => {
   const { amount, bidder = 'Voice User' } = req.body;
-  
-  // Reuse the existing bid logic
-  app.request.params = { id: req.params.id };
-  app.request.body = { amount, bidder };
-  
-  // Call the existing bid endpoint logic
   const product = auctionData.products.find(p => p.id === req.params.id);
-  if (!product) {
-    return res.status(404).json({ 
-      response: 'Sorry, I could not find that product.',
-      error: 'Product not found' 
-    });
-  }
+  if (!product) return res.status(404).json({ response: 'Sorry, I could not find that product.', error: 'Product not found' });
+  if (product.timeRemaining <= 0) return res.status(400).json({ response: 'Sorry, this auction has already ended.', error: 'Auction has ended' });
+  if (amount <= product.currentBid) return res.status(400).json({ response: `Your bid of $${parseInt(amount).toLocaleString()} is too low. The current highest bid is $${product.currentBid.toLocaleString()}. Please bid higher.`, error: 'Bid too low' });
 
-  if (product.timeRemaining <= 0) {
-    return res.status(400).json({ 
-      response: 'Sorry, this auction has already ended.',
-      error: 'Auction has ended' 
-    });
-  }
-
-  if (amount <= product.currentBid) {
-    return res.status(400).json({ 
-      response: `Your bid of $${parseInt(amount).toLocaleString()} is too low. The current highest bid is $${product.currentBid.toLocaleString()}. Please bid higher.`,
-      error: 'Bid too low'
-    });
-  }
-
-  // Place the bid
   const newBid = {
     id: uuidv4(),
     amount: parseInt(amount),
@@ -235,25 +168,29 @@ app.post('/api/voice/place-bid/:id', (req, res) => {
 
   product.bidHistory.push(newBid);
   product.currentBid = parseInt(amount);
-  
-  // Update stats
   auctionData.stats.totalBids++;
   auctionData.stats.totalValue = auctionData.products.reduce((sum, p) => sum + p.currentBid, 0);
 
-  // Broadcast update
-  broadcastUpdate({ 
-    type: 'new-bid', 
-    productId: req.params.id, 
-    product, 
-    stats: auctionData.stats 
-  });
+  broadcastUpdate({ type: 'new-bid', productId: req.params.id, product, stats: auctionData.stats });
 
-  res.json({
-    response: `Congratulations! Your bid of $${parseInt(amount).toLocaleString()} for ${product.name} has been placed successfully. You are now the highest bidder.`,
-    success: true,
-    bid: newBid,
-    product
-  });
+  res.json({ response: `Congratulations! Your bid of $${parseInt(amount).toLocaleString()} for ${product.name} has been placed successfully. You are now the highest bidder.`, success: true, bid: newBid, product });
+});
+
+// Omni voice agent integration route
+app.post('/api/voice/query', async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'No message provided' });
+  try {
+    const omniRes = await axios.post(
+      'https://api.omni.chat/v1/query',
+      { input: message, sessionId: 'auction-session' },
+      { headers: { Authorization: `Bearer bYV5tHRXnjKGRoC0jfOfnCRLKAe1TgoV5XcUCU2vqt0`, 'Content-Type': 'application/json' } }
+    );
+    res.json({ response: omniRes.data.response });
+  } catch (err) {
+    console.error('Omni API Error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch from Omni API' });
+  }
 });
 
 const PORT = process.env.PORT || 3001;
